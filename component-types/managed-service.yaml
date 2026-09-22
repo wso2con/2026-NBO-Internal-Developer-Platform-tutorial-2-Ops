@@ -1,0 +1,330 @@
+# managed-service — a service whose replica count and database connection budget the
+# platform governs.
+#
+# Cluster-wide and generic: any project may use it. Why it exists rather than the stock
+# `service` ClusterComponentType:
+#
+#   1. Stock spells its rules in the DEPRECATED `spec.validations`, and the CRD refuses to
+#      have that and `preRenderValidations` both populated. Any additional pre-render rule
+#      must therefore live on a type that uses `preRenderValidations`, which stock cannot.
+#   2. The pool has to be a PLATFORM knob. `dbMaxConns` is an environmentConfig here, which
+#      is what makes a component's total demand on the database expressible as a rule the
+#      platform can evaluate before it renders anything.
+#
+# Everything else is stock `service`, deliberately. In particular the external HTTPRoute is
+# structurally identical, because the `api-configuration` ClusterTrait patches it by JSON
+# path (/spec/rules/0/backendRefs, /filters/0/urlRewrite/path, /matches/0/path) and a patch
+# that finds nothing succeeds silently.
+apiVersion: openchoreo.dev/v1alpha1
+kind: ClusterComponentType
+metadata:
+  name: managed-service
+spec:
+  workloadType: deployment
+
+  allowedTraits:
+    - kind: ClusterTrait
+      name: observability-alert-rule
+    - kind: ClusterTrait
+      name: api-configuration
+
+  allowedWorkflows:
+    - kind: ClusterWorkflow
+      name: paketo-buildpacks-builder
+    - kind: ClusterWorkflow
+      name: gcp-buildpacks-builder
+    - kind: ClusterWorkflow
+      name: dockerfile-builder
+    - kind: ClusterWorkflow
+      name: ballerina-buildpack-builder
+
+  environmentConfigs:
+    openAPIV3Schema:
+      type: object
+      $defs:
+        ResourceQuantity:
+          type: object
+          default: {}
+          properties:
+            cpu:
+              type: string
+              default: 100m
+            memory:
+              type: string
+              default: 256Mi
+        ResourceRequirements:
+          type: object
+          default: {}
+          properties:
+            limits:
+              $ref: '#/$defs/ResourceQuantity'
+            requests:
+              $ref: '#/$defs/ResourceQuantity'
+      properties:
+        imagePullPolicy:
+          type: string
+          default: IfNotPresent
+          enum: [Always, IfNotPresent, Never]
+        resources:
+          $ref: '#/$defs/ResourceRequirements'
+        replicas:
+          type: integer
+          default: 1
+          minimum: 1
+          maximum: 10
+        # A per-component slice of a budget the component cannot see: Postgres enforces
+        # max_connections across every client at once, and nothing in a component's own
+        # configuration reveals it. `maximum: 60` is only the schema's outer bound — it is
+        # not a capacity rule, and expressing one is a separate preRenderValidation.
+        dbMaxConns:
+          type: integer
+          default: 10
+          minimum: 1
+          maximum: 60
+
+  # One rule, and it is not a capacity rule.
+  #
+  # A second rule was intended here, rejecting a raw DB_MAX_CONNS on the workload. It is
+  # NOT POSSIBLE: preRender context exposes only workload.container.{image,command,args} —
+  # there is no `env` field, and the API rejects the rule with
+  #   undefined field 'env'
+  #
+  # It turns out not to be needed. A workload's own env vars do not reach the container's
+  # `env` list at all: they become a ConfigMap referenced through `envFrom` (see the
+  # env-config resource below). Kubernetes resolves `env` over `envFrom` for the same key,
+  # so the value injected above WINS over anything the workload sets. The knob is the only
+  # door by construction rather than by rule.
+  preRenderValidations:
+    - rule: '${size(workload.endpoints) > 0}'
+      message: "Service components must have at least one endpoint. Use deployment/worker for components without endpoints."
+
+  resources:
+    - id: deployment
+      targetPlane: dataplane
+      template:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ${metadata.name}
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          replicas: ${environmentConfigs.replicas}
+          selector:
+            matchLabels: ${metadata.podSelectors}
+          template:
+            metadata:
+              labels: ${metadata.podSelectors}
+            spec:
+              containers:
+                - name: main
+                  image: ${workload.container.image}
+                  imagePullPolicy: ${environmentConfigs.imagePullPolicy}
+                  args: |
+                    ${has(workload.container.args) ? workload.container.args : oc_omit()}
+                  command: |
+                    ${has(workload.container.command) ? workload.container.command : oc_omit()}
+                  # The pool is appended to whatever the dependencies resolver produced, so
+                  # the value the platform validated is the value the process receives.
+                  #
+                  # DB_MIN_CONNS is DERIVED, never exposed. ledger refuses to start when
+                  # DB_MAX_CONNS is below DB_MIN_CONNS, so a rule that caps the max could
+                  # otherwise produce a second, unrelated-looking startup failure.
+                  #
+                  # dyn() is required, not decorative. toContainerEnvs() is typed
+                  # list(EnvVarEntry); a map literal is list(map(string,string)); CEL's
+                  # checker refuses '_+_' across them and the API rejects the type outright:
+                  #   found no matching overload for '_+_' applied to
+                  #   '(list(EnvVarEntry), list(map(string, string)))'
+                  # There is no CEL constructor for EnvVarEntry, so dyn() on both sides is
+                  # the way to concatenate. Both serialise to {name, value} regardless.
+                  env: |
+                    ${dyn(dependencies.toContainerEnvs()) + dyn([
+                      {"name": "DB_MAX_CONNS", "value": string(environmentConfigs.dbMaxConns)},
+                      {"name": "DB_MIN_CONNS", "value": string(environmentConfigs.dbMaxConns < 10 ? environmentConfigs.dbMaxConns : 10)}
+                    ])}
+                  envFrom: ${configurations.toContainerEnvFrom()}
+                  resources:
+                    limits:
+                      cpu: ${environmentConfigs.resources.limits.cpu}
+                      memory: ${environmentConfigs.resources.limits.memory}
+                    requests:
+                      cpu: ${environmentConfigs.resources.requests.cpu}
+                      memory: ${environmentConfigs.resources.requests.memory}
+                  volumeMounts: ${configurations.toContainerVolumeMounts() + dependencies.toContainerVolumeMounts()}
+              volumes: ${configurations.toVolumes() + dependencies.toVolumes()}
+
+    - id: service
+      targetPlane: dataplane
+      includeWhen: '${size(workload.endpoints) > 0}'
+      template:
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: ${metadata.componentName}
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          type: ClusterIP
+          selector: ${metadata.podSelectors}
+          ports: ${workload.toServicePorts()}
+
+    # Every `service`-shaped component in a namespace shares ONE external hostname per
+    # environment - {env}-{namespace}.{gateway} - and is separated by path prefix. That is
+    # what puts the console and both APIs on a single origin, which is why the console
+    # needs no per-environment configuration and no CORS.
+    - id: httproute-external
+      targetPlane: dataplane
+      forEach: '${workload.endpoints.transformMap(name, ep, "external" in ep.visibility && ep.type in ["HTTP", "GraphQL", "Websocket"], ep)}'
+      var: endpoint
+      template:
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        metadata:
+          name: ${oc_generate_name(metadata.componentName, endpoint.key)}
+          namespace: ${metadata.namespace}
+          labels: '${oc_merge(metadata.labels, {"openchoreo.dev/endpoint-name": endpoint.key, "openchoreo.dev/endpoint-visibility": "external"})}'
+        spec:
+          hostnames: |
+            ${[gateway.ingress.external.?http, gateway.ingress.external.?https]
+              .filter(g, g.hasValue()).map(g, g.value().host).distinct()
+              .map(h, metadata.environmentName + "-" + metadata.componentNamespace + "." + h)}
+          parentRefs:
+            - name: ${gateway.ingress.external.name}
+              namespace: ${gateway.ingress.external.namespace}
+          rules:
+            - backendRefs:
+                - name: ${metadata.componentName}
+                  port: ${endpoint.value.port}
+              filters:
+                - type: URLRewrite
+                  urlRewrite:
+                    path:
+                      type: ReplacePrefixMatch
+                      replacePrefixMatch: '${endpoint.value.?basePath.orValue("/")}'
+                - type: CORS
+                  cors:
+                    allowCredentials: false
+                    allowOrigins: ["*"]
+                    allowMethods: [GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD]
+                    allowHeaders: ["*"]
+                    exposeHeaders: ["*"]
+              matches:
+                - path:
+                    type: PathPrefix
+                    value: /${metadata.componentName}-${endpoint.key}
+
+    # Kept for fidelity with stock. This data plane has no internal gateway configured, so
+    # nothing in mopay uses `internal` visibility and this renders nothing.
+    - id: httproute-internal
+      targetPlane: dataplane
+      forEach: '${workload.endpoints.transformMap(name, ep, "internal" in ep.visibility && ep.type in ["HTTP", "GraphQL", "Websocket"], ep)}'
+      var: endpoint
+      template:
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        metadata:
+          name: ${oc_generate_name(metadata.componentName, endpoint.key, "internal")}
+          namespace: ${metadata.namespace}
+          labels: '${oc_merge(metadata.labels, {"openchoreo.dev/endpoint-name": endpoint.key, "openchoreo.dev/endpoint-visibility": "internal"})}'
+        spec:
+          hostnames: |
+            ${[gateway.ingress.internal.?http, gateway.ingress.internal.?https]
+              .filter(g, g.hasValue()).map(g, g.value().host).distinct()
+              .map(h, metadata.environmentName + "-" + metadata.componentNamespace + "." + h)}
+          parentRefs:
+            - name: ${gateway.ingress.internal.name}
+              namespace: ${gateway.ingress.internal.namespace}
+          rules:
+            - backendRefs:
+                - name: ${metadata.componentName}
+                  port: ${endpoint.value.port}
+              filters:
+                - type: URLRewrite
+                  urlRewrite:
+                    path:
+                      type: ReplacePrefixMatch
+                      replacePrefixMatch: '${endpoint.value.?basePath.orValue("/")}'
+              matches:
+                - path:
+                    type: PathPrefix
+                    value: /${metadata.componentName}-${endpoint.key}
+
+    - id: env-config
+      targetPlane: dataplane
+      forEach: '${configurations.toConfigEnvsByContainer()}'
+      var: envConfig
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${envConfig.resourceName}
+          namespace: ${metadata.namespace}
+        data: |
+          ${envConfig.envs.transformMapEntry(index, env, {env.name: env.value})}
+
+    - id: file-config
+      targetPlane: dataplane
+      forEach: '${configurations.toConfigFileList()}'
+      var: config
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${config.resourceName}
+          namespace: ${metadata.namespace}
+        data:
+          ${config.name}: |
+            ${config.value}
+
+    - id: secret-env-external
+      targetPlane: dataplane
+      forEach: '${configurations.toSecretEnvsByContainer()}'
+      var: secretEnv
+      template:
+        apiVersion: external-secrets.io/v1
+        kind: ExternalSecret
+        metadata:
+          name: ${secretEnv.resourceName}
+          namespace: ${metadata.namespace}
+        spec:
+          refreshInterval: 15s
+          secretStoreRef:
+            kind: ClusterSecretStore
+            name: ${dataplane.secretStore}
+          target:
+            name: ${secretEnv.resourceName}
+            creationPolicy: Owner
+          data: |
+            ${secretEnv.envs.map(secret, {
+              "secretKey": secret.name,
+              "remoteRef": {
+                "key": secret.remoteRef.key,
+                ?"property": secret.remoteRef.?property
+              }
+            })}
+
+    - id: secret-file-external
+      targetPlane: dataplane
+      forEach: '${configurations.toSecretFileList()}'
+      var: file
+      template:
+        apiVersion: external-secrets.io/v1
+        kind: ExternalSecret
+        metadata:
+          name: ${file.resourceName}
+          namespace: ${metadata.namespace}
+        spec:
+          refreshInterval: 15s
+          secretStoreRef:
+            kind: ClusterSecretStore
+            name: ${dataplane.secretStore}
+          target:
+            name: ${file.resourceName}
+            creationPolicy: Owner
+          data:
+            - secretKey: ${file.name}
+              remoteRef:
+                key: ${file.remoteRef.key}
+                property: |
+                  ${has(file.remoteRef.property) ? file.remoteRef.property : oc_omit()}

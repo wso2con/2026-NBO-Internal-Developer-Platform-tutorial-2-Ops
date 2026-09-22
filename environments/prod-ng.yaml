@@ -1,0 +1,26 @@
+# Nigerian production.
+#
+# Shape verified 17 Sept 2026 against the openchoreo/openchoreo CRD schema
+# (config/crd/bases/openchoreo.dev_environments.yaml) and the project's own
+# samples/getting-started/environments.yaml.
+#
+# `spec` accepts exactly three fields — dataPlaneRef, gateway, isProduction. Display name
+# and description are ANNOTATIONS, not spec fields: the CRD does not set
+# x-kubernetes-preserve-unknown-fields, so putting them under spec gets them silently
+# pruned on apply, leaving an environment with no display name and no error to explain it.
+apiVersion: openchoreo.dev/v1alpha1
+kind: Environment
+metadata:
+  name: prod-ng
+  namespace: default
+  annotations:
+    openchoreo.dev/display-name: Production — Nigeria
+    openchoreo.dev/description: Nigerian production. Data residency boundary; DATA_REGION=NG.
+  labels:
+    openchoreo.dev/name: prod-ng
+spec:
+  dataPlaneRef:
+    kind: ClusterDataPlane
+    name: default
+  # Gates production-only validations on ComponentTypes and Traits.
+  isProduction: true

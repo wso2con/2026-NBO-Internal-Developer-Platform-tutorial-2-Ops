@@ -1,0 +1,41 @@
+# mopay-regional — the promotion path for both `mopay` and `merchant-platform`.
+#
+# Branches at staging: one build fans out to both regions, so a single artifact reaches two
+# separate data-residency boundaries. The stock `default` pipeline is left untouched; it
+# still serves the `default` project.
+#
+# Shape verified 17 Sept 2026 against the openchoreo/openchoreo CRD schema
+# (config/crd/bases/openchoreo.dev_deploymentpipelines.yaml) and
+# samples/getting-started/deployment-pipeline.yaml. `spec` accepts exactly one field,
+# promotionPaths; display name and description are annotations.
+#
+# `kind` on the environment refs is optional — only `name` is required, and the server
+# defaults kind to Environment. It is written out here because the API returns it.
+apiVersion: openchoreo.dev/v1alpha1
+kind: DeploymentPipeline
+metadata:
+  name: mopay-regional
+  namespace: default
+  annotations:
+    openchoreo.dev/display-name: mopay Regional Pipeline
+    openchoreo.dev/description: development → staging → prod-ke and prod-ng
+  labels:
+    openchoreo.dev/name: mopay-regional
+spec:
+  promotionPaths:
+    - sourceEnvironmentRef:
+        kind: Environment
+        name: development
+      targetEnvironmentRefs:
+        - kind: Environment
+          name: staging
+    # A promotion from staging fans out to both regions. A developer may still pick one
+    # on the ReleaseBinding call; the pipeline only says which are reachable.
+    - sourceEnvironmentRef:
+        kind: Environment
+        name: staging
+      targetEnvironmentRefs:
+        - kind: Environment
+          name: prod-ke
+        - kind: Environment
+          name: prod-ng

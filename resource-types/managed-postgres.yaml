@@ -1,0 +1,399 @@
+# managed-postgres — in-cluster Postgres with a platform-set connection ceiling.
+#
+# Cluster-wide and generic: it knows nothing about mopay or merchant-platform. Developers
+# create as many Resources from it as they need, each bringing its own schema. Replaces the
+# earlier postgres-mopay / postgres-merchant pair, which differed only in the SQL they
+# carried and which made onboarding a third application a platform change.
+#
+# Shape verified against OpenChoreo v1.2.5 CRD schemas.
+apiVersion: openchoreo.dev/v1alpha1
+kind: ClusterResourceType
+metadata:
+  name: managed-postgres
+spec:
+  retainPolicy: Delete
+
+  parameters:
+    openAPIV3Schema:
+      type: object
+      properties:
+        database:
+          type: string
+          default: appdb
+        # The developer's schema. Keys are filenames.
+        #
+        # initdb executes *.sh and *.sql from its directory itself, but cannot bind psql
+        # variables — so a script needing :app_role or :region has no way to receive them.
+        # Give those files any other extension (.psql by convention) and 99-migrate.sh
+        # applies them instead, with the variables bound.
+        #
+        # Storage is emptyDir, so initdb runs again on every pod start: scripts must be
+        # idempotent.
+        initScripts:
+          type: object
+          default: {}
+          additionalProperties:
+            type: string
+
+  environmentConfigs:
+    openAPIV3Schema:
+      type: object
+      properties:
+        adminEnabled:
+          type: boolean
+          default: false
+        memory:
+          type: string
+          default: 256Mi
+        # Per-environment values for the init scripts. Each key K is injected as OCINIT_K
+        # and offered to psql as -v k=<value>, lower-cased. A database provisioned for a
+        # region sets REGION here; the type never learns what a region is.
+        initEnv:
+          type: object
+          default: {}
+          additionalProperties:
+            type: string
+
+  outputs:
+    - name: host
+      value: ${metadata.name}.${metadata.namespace}.svc.cluster.local
+    - name: port
+      value: "5432"
+    - name: database
+      configMapKeyRef: {name: "${metadata.name}-config", key: database}
+    - name: username
+      configMapKeyRef: {name: "${metadata.name}-config", key: username}
+    - name: password
+      secretKeyRef: {name: "${metadata.name}-creds", key: password}
+    - name: url
+      secretKeyRef: {name: "${metadata.name}-creds", key: url}
+    # The owner DSN. A schema that revokes DELETE from the application role — as mopay's
+    # append-only tables do — leaves `url` unable to truncate, so seeding and maintenance
+    # need this. Not exposed by the stock postgres type.
+    - name: ownerUrl
+      secretKeyRef: {name: "${metadata.name}-creds-postgres", key: url}
+    - name: adminURL
+      value: |
+        ${environmentConfigs.adminEnabled
+          ? (has(gateway.ingress.external.https)
+              ? "https://" + metadata.resourceName + "-admin-" + metadata.environmentName + "-" + metadata.resourceNamespace + "." + gateway.ingress.external.https.host + ":" + string(gateway.ingress.external.https.port) + "/?pgsql=" + metadata.name + "&username=demo&db=" + parameters.database
+              : has(gateway.ingress.external.http)
+                  ? "http://" + metadata.resourceName + "-admin-" + metadata.environmentName + "-" + metadata.resourceNamespace + "." + gateway.ingress.external.http.host + ":" + string(gateway.ingress.external.http.port) + "/?pgsql=" + metadata.name + "&username=demo&db=" + parameters.database
+                  : "no-gateway-configured")
+          : "disabled"}
+    # ⚠️ Must match the password in `02-create-admin-user.sh` below. Both ship as
+    # REPLACE_ME and must be changed before this type is used anywhere real.
+    - name: adminPassword
+      value: '${environmentConfigs.adminEnabled ? "REPLACE_ME" : "disabled"}'
+
+  resources:
+    - id: config
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${metadata.name}-config
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        data:
+          database: ${parameters.database}
+          username: ${metadata.resourceName}-user
+
+    # The platform's own scripts, kept literal and readable. The developer's scripts live
+    # in a SECOND ConfigMap and the two are combined by a projected volume, so neither has
+    # to be expressed as an escaped CEL string inside the other.
+    - id: init-scripts
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${metadata.name}-init
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        data:
+          01-create-app-user.sh: |
+            #!/bin/bash
+            set -e
+            psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<EOSQL
+              CREATE USER "$APPUSER" WITH PASSWORD '$APPUSER_PASSWORD';
+              GRANT ALL ON DATABASE "$POSTGRES_DB" TO "$APPUSER";
+              GRANT ALL ON SCHEMA public TO "$APPUSER";
+            EOSQL
+          # ⚠️ REPLACE BEFORE USE — a SUPERUSER login for the optional Adminer console.
+          #
+          # This script is NOT gated by `adminEnabled`: that flag controls only whether the
+          # Adminer deployment and its gateway route are created. The role below is created
+          # on EVERY database this type provisions, so a shipped password would be a live
+          # superuser credential in every environment.
+          #
+          # Replace REPLACE_ME here AND in the `adminPassword` output above — the two must
+          # match or the console reports the wrong password. For anything beyond a
+          # throwaway cluster, delete this script and the Adminer resources entirely.
+          02-create-admin-user.sh: |
+            #!/bin/bash
+            set -e
+            psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<EOSQL
+              CREATE USER demo WITH SUPERUSER PASSWORD 'REPLACE_ME';
+            EOSQL
+          99-migrate.sh: |
+            #!/bin/bash
+            # Applies every init script initdb itself skipped, in filename order, as the owner.
+            #
+            # initdb runs *.sh and *.sql directly but cannot bind psql variables. Scripts
+            # needing :app_role, :region and the like therefore carry another extension so
+            # initdb ignores them, and are applied here with the variables bound.
+            #
+            # Numbered 99 so the roles above exist first.
+            set -e
+
+            # Per-environment values arrive as OCINIT_*; each becomes a lower-cased psql
+            # variable. Built here rather than in the template because the set is not known
+            # until a Resource is bound to an environment.
+            psql_vars=""
+            while IFS='=' read -r key value; do
+                case "$key" in
+                    OCINIT_*) ;;
+                    *) continue ;;
+                esac
+                # Stripped with sed rather than shell parameter expansion: the renderer
+                # evaluates dollar-brace syntax as CEL wherever it appears in a template,
+                # including inside this script, and shell expansion is not valid CEL.
+                name=$(printf '%s' "$key" | sed 's/^OCINIT_//' | tr '[:upper:]' '[:lower:]')
+                psql_vars="$psql_vars -v $name=$value"
+            done <<EOF
+            $(env)
+            EOF
+
+            shopt -s nullglob
+            for f in /docker-entrypoint-initdb.d/*; do
+                case "$f" in
+                    *.sh|*.sql|*.sql.gz) continue ;;
+                esac
+                echo "migrate: applying $(basename "$f")"
+                # shellcheck disable=SC2086
+                psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+                     -v app_role="$APPUSER" \
+                     -v app_password="$APPUSER_PASSWORD" \
+                     -v db_name="$POSTGRES_DB" \
+                     $psql_vars \
+                     -f "$f"
+            done
+
+            echo "migrate: all scripts applied"
+
+    # The developer's schema, verbatim.
+    - id: init-scripts-user
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${metadata.name}-init-user
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        data: ${parameters.initScripts}
+
+    - id: password-gen-postgres
+      template:
+        apiVersion: generators.external-secrets.io/v1alpha1
+        kind: Password
+        metadata:
+          name: ${metadata.name}-creds-postgres
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec: {allowRepeat: true, digits: 8, length: 32, noUpper: false, symbols: 0}
+
+    - id: secret-creds-postgres
+      template:
+        apiVersion: external-secrets.io/v1
+        kind: ExternalSecret
+        metadata:
+          name: ${metadata.name}-creds-postgres
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          refreshInterval: "0"
+          dataFrom:
+            - sourceRef:
+                generatorRef:
+                  apiVersion: generators.external-secrets.io/v1alpha1
+                  kind: Password
+                  name: ${metadata.name}-creds-postgres
+          target:
+            name: ${metadata.name}-creds-postgres
+            creationPolicy: Owner
+            template:
+              type: Opaque
+              data:
+                password: '{{ .password }}'
+                url: postgres://postgres:{{ .password }}@${metadata.name}.${metadata.namespace}.svc.cluster.local:5432/${parameters.database}?sslmode=disable
+
+    - id: password-gen-creds
+      template:
+        apiVersion: generators.external-secrets.io/v1alpha1
+        kind: Password
+        metadata:
+          name: ${metadata.name}-creds
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec: {allowRepeat: true, digits: 8, length: 32, noUpper: false, symbols: 0}
+
+    - id: secret-creds
+      template:
+        apiVersion: external-secrets.io/v1
+        kind: ExternalSecret
+        metadata:
+          name: ${metadata.name}-creds
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          refreshInterval: "0"
+          dataFrom:
+            - sourceRef:
+                generatorRef:
+                  apiVersion: generators.external-secrets.io/v1alpha1
+                  kind: Password
+                  name: ${metadata.name}-creds
+          target:
+            name: ${metadata.name}-creds
+            creationPolicy: Owner
+            template:
+              type: Opaque
+              data:
+                password: '{{ .password }}'
+                url: postgres://${metadata.resourceName}-user:{{ .password }}@${metadata.name}.${metadata.namespace}.svc.cluster.local:5432/${parameters.database}?sslmode=disable
+
+    - id: service
+      template:
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: ${metadata.name}
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          selector: {app: "${metadata.name}"}
+          ports:
+            - {name: postgres, port: 5432, targetPort: 5432}
+
+    - id: statefulset
+      readyWhen: '${applied.statefulset.status.readyReplicas == applied.statefulset.status.replicas && applied.statefulset.status.replicas > 0}'
+      template:
+        apiVersion: apps/v1
+        kind: StatefulSet
+        metadata:
+          name: ${metadata.name}
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          replicas: 1
+          serviceName: ${metadata.name}
+          selector:
+            matchLabels: {app: "${metadata.name}"}
+          template:
+            metadata:
+              labels: {app: "${metadata.name}"}
+            spec:
+              containers:
+                - name: postgres
+                  image: postgres:16-alpine
+                  # THE CEILING. A literal — not a parameter, not an environmentConfig.
+                  # Unreachable and unreadable from any developer-facing schema.
+                  #
+                  # Postgres reserves 3 for superusers, so 27 are usable, and 27 is the
+                  # figure a platform rule on component pool sizes is written against.
+                  #
+                  # Deliberately small. A larger ceiling is more realistic, but the number
+                  # of concurrent clients needed to reach it scales with it: connections
+                  # held is roughly concurrency x (db time / request time).
+                  args: ["postgres", "-c", "max_connections=30"]
+                  ports:
+                    - {name: postgres, containerPort: 5432}
+                  # dyn() on both sides: the literal list infers map(string, dyn) because
+                  # some entries carry valueFrom, and the initEnv list infers
+                  # map(string, string). CEL will not concatenate the two otherwise.
+                  env: |
+                    ${dyn([
+                      {"name": "POSTGRES_USER", "value": "postgres"},
+                      {"name": "POSTGRES_DB", "valueFrom": {"configMapKeyRef": {"name": metadata.name + "-config", "key": "database"}}},
+                      {"name": "POSTGRES_PASSWORD", "valueFrom": {"secretKeyRef": {"name": metadata.name + "-creds-postgres", "key": "password"}}},
+                      {"name": "APPUSER", "valueFrom": {"configMapKeyRef": {"name": metadata.name + "-config", "key": "username"}}},
+                      {"name": "APPUSER_PASSWORD", "valueFrom": {"secretKeyRef": {"name": metadata.name + "-creds", "key": "password"}}},
+                      {"name": "PGDATA", "value": "/var/lib/postgresql/data/pgdata"}
+                    ]) + dyn(environmentConfigs.initEnv.map(k, {"name": "OCINIT_" + k, "value": environmentConfigs.initEnv[k]}))}
+                  resources:
+                    limits:
+                      memory: ${environmentConfigs.memory}
+                  volumeMounts:
+                    - {name: data, mountPath: /var/lib/postgresql/data}
+                    - {name: init-scripts, mountPath: /docker-entrypoint-initdb.d}
+              volumes:
+                - name: data
+                  emptyDir: {}
+                # Projected, so the platform's scripts and the developer's land in one
+                # directory without either having to be embedded in the other.
+                - name: init-scripts
+                  projected:
+                    defaultMode: 493
+                    sources:
+                      - configMap: {name: "${metadata.name}-init"}
+                      - configMap: {name: "${metadata.name}-init-user"}
+
+    - id: admin-deployment
+      includeWhen: '${environmentConfigs.adminEnabled && has(gateway.ingress.external)}'
+      template:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ${metadata.name}-admin
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels: {app: "${metadata.name}-admin"}
+          template:
+            metadata:
+              labels: {app: "${metadata.name}-admin"}
+            spec:
+              containers:
+                - name: adminer
+                  image: adminer:4.8.1-standalone
+                  ports:
+                    - {name: http, containerPort: 8080}
+                  env:
+                    - {name: ADMINER_DEFAULT_SERVER, value: "${metadata.name}"}
+
+    - id: admin-service
+      includeWhen: '${environmentConfigs.adminEnabled && has(gateway.ingress.external)}'
+      template:
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: ${metadata.name}-admin
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          selector: {app: "${metadata.name}-admin"}
+          ports:
+            - {name: http, port: 8080, targetPort: 8080}
+
+    - id: admin-route
+      includeWhen: '${environmentConfigs.adminEnabled && has(gateway.ingress.external)}'
+      template:
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        metadata:
+          name: ${metadata.name}-admin
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          hostnames: |
+            ${[gateway.ingress.external.?http, gateway.ingress.external.?https]
+              .filter(g, g.hasValue()).map(g, g.value().host).distinct()
+              .map(h, metadata.resourceName + "-admin-" + metadata.environmentName + "-" + metadata.resourceNamespace + "." + h)}
+          parentRefs:
+            - name: ${gateway.ingress.external.name}
+              namespace: ${gateway.ingress.external.namespace}
+          rules:
+            - backendRefs:
+                - {name: "${metadata.name}-admin", port: 8080}
